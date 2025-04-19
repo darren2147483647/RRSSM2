@@ -1,5 +1,4 @@
 tiny_model/
-TransTIC/
 TransTIC/ckpt/
 TransTIC/dataset/
 TransTIC/examples/tiny_model/river_model/latest.pth
