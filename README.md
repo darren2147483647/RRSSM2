@@ -6,6 +6,32 @@ TransTIC : https://github.com/NYCU-MAPL/TransTIC
 
 RRSSM : https://github.com/nccudrone/RRSSM
 
+# 程式
+
+根目錄 : TransTIC/
+
+- 訓練
+
+進入conda環境
+
+記得更改config/segmentation.yaml的ckpt與設置
+
+```
+python examples/segmentation.py -c config/segmentation.yaml
+```
+
+- 測試
+
+進入conda環境
+
+記得更改config/segmentation.yaml的ckpt與設置
+
+```
+python examples/segmentation.py -c config/segmentation.yaml -I
+```
+
+結果會在inference_img/
+
 # TODO
 
 繪製rd圖
