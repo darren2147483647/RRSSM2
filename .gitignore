@@ -1,3 +1,8 @@
 tiny_model/
 TransTIC/
+TransTIC/ckpt/
+TransTIC/dataset/
+TransTIC/examples/tiny_model/river_model/latest.pth
+TransTIC/inference_img/
+TransTIC/LOG_PATH/
 tiny_model.zip
