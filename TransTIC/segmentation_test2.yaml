@@ -1,16 +1,16 @@
 root: LOG_PATH
-exp_name: "exp3"
+exp_name: "exp_2"
 model: "tic_promptmodel_first2"
 dataset: "RIVERAVSSD" # "coco"
 dataset_path: ./dataset/RIVERAVSSD
 maskrcnn_path: MASKRCNN_PATH_FROM_DETECTRON2
-checkpoint: ./ckpt/seg_3.pth.tar #./LOG_PATH/exp3/1/checkpoint_best_loss.pth.tar #./ckpt/base_codec_3.pth.tar #./LOG_PATH/exp3/1/checkpoint.pth.tar #./ckpt/base_codec_3.pth.tar #./ckpt/seg_3.pth.tar #./LOG_PATH/exp2/1/checkpoint_best_loss.pth.tar #./ckpt/seg_3.pth.tar  # could be pre-trained base codec (for training) or trained TransTIC (for evaluation)
+checkpoint: ./LOG_PATH/exp_2/2/checkpoint_best_loss.pth.tar # could be pre-trained base codec (for training) or trained TransTIC (for evaluation)
 epochs: 40
 learning_rate: 1.e-4
 num_workers: 4
-quality_level: 1 # {1,2,3,4}
-lmbda:  0.0018 # {0.0018, 0.0035, 0.0067, 0.013}
-batch_size: 8
+quality_level: 2 # {1,2,3,4}
+lmbda:  0.0035 # {0.0018, 0.0035, 0.0067, 0.013}
+batch_size: 1
 test_batch_size: 1
 aux_learning_rate: 1.e-3
 patch_size: 256
@@ -27,7 +27,7 @@ PROJECT: -1
 DROPOUT: 0.
 TRANSFER_TYPE: 'prompt'
 ARCHITECT: 'both'
-VPT_lmbda: 2 # {2, 1, 0.5, 0.2}
+VPT_lmbda: 1 # {2, 1, 0.5, 0.2}
 WINDOW: 'same'
 HYPERPRIOR: False
 RETURN_ATTENTION: False

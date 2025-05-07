@@ -53,6 +53,7 @@ from compressai.zoo import image_models
 
 import yaml
 
+import numpy as np
 
 import tiny_model
 #from tiny_model.predict import tiny_model_RRSSM
@@ -61,7 +62,9 @@ import tiny_model
 '''from detectron2.config import get_cfg
 from detectron2.layers import ShapeSpec
 from detectron2.modeling.backbone.fpn import build_resnet_fpn_backbone'''
-from utils.dataloader import MSCOCO, Kodak, RIVERAVSSD
+from utils.dataloader import MSCOCO, Kodak, RIVERAVSSD, RIVERAVSSD_rd
+
+from PIL import Image
 
 ## Test
 '''from detectron2.evaluation import COCOEvaluator
@@ -73,6 +76,7 @@ from contextlib import ExitStack, contextmanager
 '''from utils.predictor import ModPredictor'''
 from utils.alignment import Alignment
 
+from torch.utils.tensorboard import SummaryWriter
 
 ## Function for model to eval
 @contextmanager
@@ -134,18 +138,20 @@ class TaskLoss(nn.Module):
         self.task_net.eval()
         self.align = Alignment(divisor=32).to(device)
         self.pixel_mean = torch.Tensor([103.530, 116.280, 123.675]).view(-1, 1, 1).to(device)
+        self.pixel_mean = torch.Tensor([123.675, 116.280, 103.530]).view(-1, 1, 1).to(device)
+        # the color space of RRSSM might be RGB(for i modify the pipeline), so I should correct it
 
     def forward(self, output, d, train_mode=False):
         with torch.no_grad():
             ## Ground truth for perceptual loss
-            d = d.flip(1).mul(255)
+            d = d.mul(255) #no more flip
             d = d - self.pixel_mean
             if not train_mode:
                 d = self.align.align(d)
             gt_out = self.task_net(d)
         
         x_hat = torch.clamp(output["x_hat"], 0, 1)
-        x_hat = x_hat.flip(1).mul(255)
+        x_hat = x_hat.mul(255) #no more flip
         x_hat = x_hat - self.pixel_mean
         if not train_mode:
             x_hat = self.align.align(x_hat)
@@ -168,11 +174,18 @@ class TaskLoss(nn.Module):
         #     print(f"已儲存圖片至: {img_path}")
         # exit()
         
-        distortion_p2 = nn.MSELoss(reduction='none')(gt_out["p2"], task_net_out["p2"])
-        distortion_p3 = nn.MSELoss(reduction='none')(gt_out["p3"], task_net_out["p3"])
-        distortion_p4 = nn.MSELoss(reduction='none')(gt_out["p4"], task_net_out["p4"])
-        distortion_p5 = nn.MSELoss(reduction='none')(gt_out["p5"], task_net_out["p5"])
+        # distortion_p2 = nn.MSELoss(reduction='none')(gt_out["p2"], task_net_out["p2"])
+        # distortion_p3 = nn.MSELoss(reduction='none')(gt_out["p3"], task_net_out["p3"])
+        # distortion_p4 = nn.MSELoss(reduction='none')(gt_out["p4"], task_net_out["p4"])
+        # distortion_p5 = nn.MSELoss(reduction='none')(gt_out["p5"], task_net_out["p5"])
         # distortion_p6 = nn.MSELoss(reduction='none')(gt_out["p6"], task_net_out["p6"])
+        
+        #改extract_feat
+        distortion_stage1 = nn.MSELoss()(gt_out[0], task_net_out[0])
+        distortion_stage2 = nn.MSELoss()(gt_out[1], task_net_out[1])
+        distortion_stage3 = nn.MSELoss()(gt_out[2], task_net_out[2])
+        distortion_stage4 = nn.MSELoss()(gt_out[3], task_net_out[3])
+        return 0.25*(distortion_stage1+distortion_stage2+distortion_stage3+distortion_stage4)
 
         return 0.25*(distortion_p2.mean()+distortion_p3.mean()+distortion_p4.mean()+distortion_p5.mean())
 
@@ -244,6 +257,25 @@ def configure_optimizers(net, args):
 
     return optimizer
 
+def compute_iou_image(seg_img_tensor, seg_origin_tensor):
+    # 確保圖像是二進制格式
+    seg_img_tensor = seg_img_tensor.astype(np.bool)
+    seg_origin_tensor = seg_origin_tensor.astype(np.bool)
+    
+    assert seg_img_tensor.shape == seg_origin_tensor.shape, f"{seg_img_tensor.shape}!={seg_origin_tensor.shape}"
+    
+    # 計算交集（交集區域是兩者都為 1 的區域）
+    intersection = np.logical_and(seg_img_tensor, seg_origin_tensor)
+    
+    # 計算聯集（聯集區域是至少有一個為 1 的區域）
+    union = np.logical_or(seg_img_tensor, seg_origin_tensor)
+    
+    # 計算 IoU
+    intersection_area = np.sum(intersection)
+    union_area = np.sum(union)
+    
+    iou = intersection_area / union_area if union_area > 0 else 0.0
+    return iou
 
 def train_one_epoch(train_dataloader, optimizer, model, criterion_rd, criterion_task, lmbda):
     model.train()
@@ -350,7 +382,39 @@ def test_epoch(test_dataloader, model, criterion_rd, predictor, evaluator):
     return
 
 
-def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda):
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+def show_image_info(x, savename=None):
+    # 顯示資料類型與大小
+    print(f"Type: {type(x)}, Shape: {x.shape}")
+
+    # 處理 torch tensor 輸入
+    if isinstance(x, torch.Tensor):
+        if x.dim() == 4:
+            x = x[0]  # 取第一張 (C, H, W)
+        if x.dim() == 3:
+            x = x.permute(1, 2, 0).detach().cpu().numpy()  # 轉為 (H, W, C)
+
+    # 處理 numpy 輸入 (假設已是 HWC)
+    if isinstance(x, np.ndarray):
+        if x.ndim == 4:
+            x = x[0]  # 取第一張 (H, W, C)
+
+    # 顯示圖片
+    h, w = x.shape[:2]
+    dpi = 100  # 或自己設定成其他數值
+    plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)  # 這樣才能 1 pixel 對 1 pixel
+    plt.imshow(x.astype(np.uint8) if x.dtype != np.uint8 else x)
+    plt.axis('off')
+    if savename:
+        plt.savefig(f'{savename}.png', bbox_inches='tight', pad_inches=0)
+    plt.show()
+
+
+def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda, quality_level = None):
     model.eval()
     device = next(model.parameters()).device
 
@@ -360,6 +424,8 @@ def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda):
     percloss = AverageMeter()
     totalloss = AverageMeter()
     
+    iou = AverageMeter()
+    
     task_net = tiny_model.tiny_model_RRSSM()
     task_net = task_net.to(device)
     for k, p in task_net.named_parameters():
@@ -368,29 +434,60 @@ def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda):
     
     batch_size = val_dataloader.batch_size
     
+    ckpt_name = "seg_3"
+    
     with torch.no_grad():
         tqdm_meter = tqdm.tqdm(enumerate(val_dataloader),leave=False, total=len(val_dataloader))
         for i, d in tqdm_meter:
             align = Alignment(divisor=256, mode='resize').to(device)
-            pixel_mean = torch.Tensor([103.530, 116.280, 123.675]).view(-1, 1, 1).to(device)
-            d = d.to(device)
-            align_d = align.align(d)
-            out_net = model(align_d)
-            out_net['x_hat'] = align.resume(out_net['x_hat']).clamp_(0, 1)
+            #origin img = 428x240
+            d = d.to(device) #torch 8,3,300,535 0~1
             
-            x_hat = out_net['x_hat'].flip(1).mul(255)
-            x_hat = x_hat - pixel_mean
+            check_d = d.cpu()*255
             
-            d255 = d.flip(1).mul(255)
-            d255 = d255 - pixel_mean
+            align_d = align.align(d) #torch 8,3,512,768 0~1
             
-            gt_out=task_net.inference(d255)
-            task_net_out=task_net.inference(x_hat)
+            check_alignd = align_d.cpu()*255
+            
+            out_net = model(align_d) #torch 8,3,512,768 0~1
+            
+            check_rawout = out_net['x_hat'].cpu()*255
+            
+            out_net['x_hat'] = align.resume(out_net['x_hat']).clamp_(0, 1) #torch 8,3,300,535 0~1
+            
+            check_resumeclipout = out_net['x_hat'].cpu()*255
+            
+            x_hat = out_net['x_hat'].mul(255) #torch 8,3,300,535
+            
+            check_xhatflipmul = x_hat.cpu()
+            
+            # x_hat = x_hat - pixel_mean #torch 8,3,300,535
+            
+            check_xhatnorm = x_hat.cpu()
+            
+            d255 = d.mul(255) #torch 8,3,300,535
+            
+            check_flipmuld = d255.cpu()
+            
+            # d255 = d255 - pixel_mean #torch 8,3,300,535
+            
+            check_normd = d255.cpu()
+            
+            gt_out=task_net.inference(d255) #300,535,3
+            task_net_out=task_net.inference(x_hat) #300,535,3
+            
+            check_dfinal0 = gt_out[0].cpu()
+            check_xfinal0 = task_net_out[0].cpu()
+            
+            print([show_image_info(x,f"infer{i}") for i,x in enumerate([check_d,check_alignd,check_rawout,check_resumeclipout,check_xhatflipmul,check_xhatnorm,check_flipmuld,check_normd,check_dfinal0,check_xfinal0])])
+            if i==1:
+                exit()
             
             from PIL import Image
-            import numpy as np
-            output_dir="./inference_img"
-            prefix="test20250402_inference"
+            output_dir="./inference_img" if quality_level is None else f"./inference_img/{ckpt_name}_{quality_level}"
+            prefix="inference"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
             for ii, (img_tensor,origin_tensor,seg_img_tensor,seg_origin_tensor) in enumerate(zip(out_net['x_hat'],d,task_net_out,gt_out)):
                 img_tensor = torch.clamp(img_tensor, 0, 1)  # 限制像素值在 [0, 1] 之間
                 img_tensor = img_tensor.permute(1, 2, 0).cpu().numpy()  # (3, 256, 256) -> (256, 256, 3)
@@ -412,6 +509,9 @@ def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda):
                 img_path = os.path.join(output_dir, f"{prefix}_{i*batch_size+ii}_result.jpg")
                 img_overview.save(img_path)
                 
+                iou_single_img = compute_iou_image(seg_img_tensor,seg_origin_tensor)
+                iou.update(iou_single_img)
+                
             out_criterion = criterion_rd(out_net, d)
             perc_loss = criterion_task(out_net, d)
             total_loss = perc_loss + lmbda * out_criterion['bpp_loss']
@@ -424,9 +524,123 @@ def inference_epoch(val_dataloader, model, criterion_rd, criterion_task, lmbda):
 
         txt = f"Loss: {totalloss.avg:.3f} | MSE loss: {mse_loss.avg:.5f} | Perception loss: {percloss.avg:.4f} | Bpp loss: {bpp_loss.avg:.4f}"
         tqdm_meter.set_postfix_str(txt)
+        
 
     model.train()
-    print(f"INFERENCE | bpp loss: {bpp_loss.avg:.5f} | psnr: {psnr.avg:.5f}")
+    print(f"INFERENCE | bpp loss: {bpp_loss.avg:.5f} | psnr: {psnr.avg:.5f} | iou avg: {iou.avg:.5f}")
+    
+    if quality_level is not None:
+        # 寫入結果檔案
+        write_rd_filepath = f"rdresult/{ckpt_name}_{quality_level}.txt"
+        with open(write_rd_filepath, 'w') as f:
+            f.write(f"{write_rd_filepath},{bpp_loss.avg},{iou.avg}\n")
+    
+    return totalloss.avg
+
+def inference_epoch_drawrd(val_dataloader, model, criterion_rd, criterion_task, lmbda, quality_level = None, ckpt_name = None):
+    print("start inference",torch.cuda.memory_allocated() / 1024 / 1024, "MB")
+    model.eval()
+    device = next(model.parameters()).device
+
+    bpp_loss = AverageMeter()
+    mse_loss = AverageMeter()
+    psnr = AverageMeter()
+    percloss = AverageMeter()
+    totalloss = AverageMeter()
+    
+    iou = AverageMeter()
+    iou2 = AverageMeter()
+    
+    task_net = tiny_model.tiny_model_RRSSM()
+    task_net = task_net.to(device)
+    for k, p in task_net.named_parameters():
+        p.requires_grad = False
+    task_net.eval()
+    
+    batch_size = val_dataloader.batch_size
+    
+    ckpt_name = ckpt_name if ckpt_name is not None else "seg"
+    print("start2 inference",torch.cuda.memory_allocated() / 1024 / 1024, "MB")
+    align = Alignment(divisor=256, mode='resize').to(device)
+    with torch.no_grad():
+        tqdm_meter = tqdm.tqdm(enumerate(val_dataloader),leave=False, total=len(val_dataloader))
+        for i, d in tqdm_meter:
+            # print(f"data inference {i}",torch.cuda.memory_allocated() / 1024 / 1024, "MB")
+            (d,d2) = d
+            
+            d = d.to(device)
+            #d2 = d2.to(device)
+            align_d = align.align(d)
+            out_net = model(align_d)
+            out_net['x_hat'] = align.resume(out_net['x_hat']).clamp_(0, 1)
+            
+            x_hat = out_net['x_hat'].mul(255)
+            
+            d255 = d.mul(255)
+            
+            gt_out=task_net.inference(d255)
+            task_net_out=task_net.inference(x_hat)
+            
+
+            output_dir="./inference_img" if quality_level is None else f"./inference_img/{ckpt_name}_{quality_level}"
+            prefix="inference"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            #d2 = d2.cpu()
+            d2 = [x.permute(1,2,0).numpy() for x in d2]
+            #print(task_net_out[0].shape,d2[0].shape)
+            for ii, (img_tensor,origin_tensor,seg_img_tensor,seg_origin_tensor,seg_gt_tensor) in enumerate(zip(out_net['x_hat'],d,task_net_out,gt_out,d2)):
+                img_tensor = torch.clamp(img_tensor, 0, 1)  # 限制像素值在 [0, 1] 之間
+                img_tensor = img_tensor.permute(1, 2, 0).cpu().numpy()  # (3, 256, 256) -> (256, 256, 3)
+                img1 = Image.fromarray((img_tensor * 255).astype('uint8'))
+                
+                origin_tensor = torch.clamp(origin_tensor, 0, 1)  # 限制像素值在 [0, 1] 之間
+                origin_tensor = origin_tensor.permute(1, 2, 0).cpu().numpy()  # (3, 256, 256) -> (256, 256, 3)
+                img2 = Image.fromarray((origin_tensor * 255).astype('uint8'))
+                
+                img3 = Image.fromarray(seg_img_tensor.astype('uint8'))
+                
+                img4 = Image.fromarray(seg_origin_tensor.astype('uint8'))
+                
+                # 儲存圖片
+                img_c = np.concatenate([img2, img1], axis=0)
+                img_seg = np.concatenate([img4, img3], axis=0)
+                img_overview = np.concatenate([img_c, img_seg], axis=1)
+                img_overview = Image.fromarray(img_overview)
+                img_path = os.path.join(output_dir, f"{prefix}_{i*batch_size+ii}_result.jpg")
+                img_overview.save(img_path)
+                
+                iou_single_img = compute_iou_image(seg_img_tensor,seg_gt_tensor)
+                iou.update(iou_single_img)
+                
+                iou_single_img2 = compute_iou_image(seg_origin_tensor,seg_gt_tensor)
+                iou2.update(iou_single_img2)
+                
+            out_criterion = criterion_rd(out_net, d)
+            perc_loss = criterion_task(out_net, d)
+            total_loss = perc_loss + lmbda * out_criterion['bpp_loss']
+
+            bpp_loss.update(out_criterion["bpp_loss"])
+            mse_loss.update(out_criterion["mse_loss"])
+            psnr.update(out_criterion['psnr'])
+            percloss.update(perc_loss)
+            totalloss.update(total_loss)
+        del out_net, align_d, x_hat, d255, gt_out, task_net_out
+        torch.cuda.empty_cache()
+
+        txt = f"Loss: {totalloss.avg:.3f} | MSE loss: {mse_loss.avg:.5f} | Perception loss: {percloss.avg:.4f} | Bpp loss: {bpp_loss.avg:.4f}"
+        tqdm_meter.set_postfix_str(txt)
+
+    print("ending inference",torch.cuda.memory_allocated() / 1024 / 1024, "MB")
+    model.train()
+    print(f"INFERENCE | bpp loss: {bpp_loss.avg:.5f} | psnr: {psnr.avg:.5f} | iou avg: {iou.avg:.5f} | origin iou avg: {iou2.avg:.5f}")
+    
+    if quality_level is not None:
+        # 寫入結果檔案
+        write_rd_filepath = f"rdresult/{ckpt_name}_{quality_level}.txt"
+        with open(write_rd_filepath, 'w') as f:
+            f.write(f"{write_rd_filepath},{bpp_loss.avg},{iou.avg}\n")
+    
     return totalloss.avg
 
 def save_checkpoint(state, is_best, base_dir, filename="checkpoint.pth.tar"):
@@ -458,6 +672,8 @@ def parse_args(argv):
 
     parser.add_argument("-T", "--TEST", action='store_true', help='Testing')
     parser.add_argument("-I", "--INFERENCE", action='store_true', help='Inferencing')
+    
+    parser.add_argument("--ckptname", type=str, help='for draw rd')
     
     args = parser.parse_args(remaining)
     
@@ -552,10 +768,14 @@ def main(argv):
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor()
         ])
+        det_transformer_small_nocrop_noflip = transforms.Compose([
+            transforms.Resize((300, 535)),
+            transforms.ToTensor()
+        ])
         #640x640似乎太大
         
-        train_dataset = RIVERAVSSD(args.dataset_path+"/p1img/originalFrames/", det_transformer_better)
-        val_dataset = RIVERAVSSD(args.dataset_path+"/p2img/img/", det_transformer_small_better)
+        train_dataset = RIVERAVSSD(args.dataset_path+"/p1img/originalFrames/", det_transformer)
+        val_dataset = RIVERAVSSD(args.dataset_path+"/p2img/img/", transforms.ToTensor())
         train_dataloader = DataLoader(train_dataset,
                                       batch_size=args.batch_size,
                                       num_workers=args.num_workers,
@@ -574,12 +794,19 @@ def main(argv):
                                     pin_memory=(device=="cuda"))
         if args.INFERENCE:
             #inf_dataset = RIVERAVSSD("./dataset/RRSSMtest/", transforms.ToTensor())
-            inf_dataset=RIVERAVSSD(args.dataset_path+"/p2img/img/", det_transformer_small_nocrop)
-            inf_dataloader = DataLoader(inf_dataset,
+            # inf_dataset=RIVERAVSSD(args.dataset_path+"/p2img/img/", det_transformer_small_nocrop_noflip)
+            inf_dataset2=RIVERAVSSD_rd(args.dataset_path+"/p2img/img/",args.dataset_path+"/p2label/mask_visual/", transforms.ToTensor())
+            # inf_dataloader = DataLoader(inf_dataset,
+            #                           batch_size=args.batch_size,
+            #                           num_workers=args.num_workers,
+            #                           shuffle=False,
+            #                           pin_memory=(device=="cuda"))
+            inf_dataloader2 = DataLoader(inf_dataset2,
                                       batch_size=args.batch_size,
                                       num_workers=args.num_workers,
                                       shuffle=False,
                                       pin_memory=(device=="cuda"))
+            
         # print(f"{len(train_dataloader)} training batch(es) have been loaded")
         # print(f"{len(val_dataloader)} testing batch(es) have been loaded")
 
@@ -618,9 +845,15 @@ def main(argv):
         test_epoch(test_dataloader, net, rdcriterion, predictor, evaluator)
         return
     if args.INFERENCE:
-        inference_epoch(inf_dataloader, net, rdcriterion, taskcriterion, args.VPT_lmbda)
+        # inference_epoch(inf_dataloader, net, rdcriterion, taskcriterion, args.VPT_lmbda, args.quality_level)
+        inference_epoch_drawrd(inf_dataloader2, net, rdcriterion, taskcriterion, args.VPT_lmbda, args.quality_level, args.ckptname)
         return
 
+    import datetime
+
+    log_dir = f"runs/exp1_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    writer = SummaryWriter(log_dir=log_dir)
+    
     best_loss = validation_epoch(-1, val_dataloader, net, rdcriterion, taskcriterion, args.VPT_lmbda)
     tqrange = tqdm.trange(last_epoch, args.epochs)
     for epoch in tqrange:
@@ -630,6 +863,9 @@ def main(argv):
 
         is_best = loss < best_loss
         best_loss = min(loss, best_loss)
+        
+        writer.add_scalar('Loss/train', loss.item(), epoch+1)
+        
         if args.save:
             save_checkpoint(
                 {
@@ -645,7 +881,7 @@ def main(argv):
             )
             if epoch%10==9:
                 shutil.copyfile(base_dir+'checkpoint.pth.tar', base_dir+ f"checkpoint_{epoch}.pth.tar" )
-    
+    writer.close()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
